@@ -1,0 +1,94 @@
+"""
+Adaptador de entrada MQTT (paho): conecta no EMQX via TLS, assina os topicos
+e entrega cada mensagem ao caso de uso IngestTelemetry.
+
+E o unico lugar que conhece paho-mqtt; o caso de uso recebe dados crus.
+"""
+
+import ssl
+import sys
+
+import paho.mqtt.client as mqtt
+
+from app.application.ingest_telemetry import IngestStatus, IngestTelemetry
+from app.infrastructure.config import Settings
+from app.infrastructure.stream_notifier import StreamNotifier
+
+
+class MqttSubscriber:
+    def __init__(
+        self,
+        settings: Settings,
+        ingest: IngestTelemetry,
+        notifier: StreamNotifier | None = None,
+    ):
+        self._settings = settings
+        self._ingest = ingest
+        self._notifier = notifier
+        self._client = self._build_client()
+
+    def _build_client(self) -> mqtt.Client:
+        client = mqtt.Client(
+            client_id=self._settings.mqtt_client_id,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            protocol=mqtt.MQTTv5,
+        )
+        if self._settings.mqtt_username:
+            client.username_pw_set(self._settings.mqtt_username, self._settings.mqtt_password)
+        client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        return client
+
+    # --- Callbacks MQTT -----------------------------------------------------
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            print(f"[OK] Conectado a {self._settings.mqtt_host}:{self._settings.mqtt_port}")
+            for topic in self._settings.mqtt_topics:
+                client.subscribe(topic, qos=self._settings.mqtt_qos)
+                print(f"[SUB] Inscrito em '{topic}' (QoS {self._settings.mqtt_qos})")
+        else:
+            print(f"[ERRO] Falha na conexao MQTT. reason_code={reason_code}")
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
+        print(f"[OFF] Desconectado do MQTT (reason_code={reason_code}). Reconectando...")
+
+    def _on_message(self, client, userdata, msg):
+        result = self._ingest.execute(
+            topic=msg.topic,
+            payload=msg.payload,
+            qos=msg.qos,
+            retain=bool(msg.retain),
+        )
+
+        if result.status is IngestStatus.INVALID_TOPIC:
+            print(f"[SKIP] Topico sem nivel de tipo de dado: {msg.topic}")
+        elif result.status is IngestStatus.UNKNOWN_MACHINE:
+            print(
+                f"[ERRO] Nao foi possivel resolver/registrar a maquina "
+                f"'{result.machine_code}' (repositorio indisponivel?) — topico {msg.topic}"
+            )
+        else:
+            event = result.event
+            status = "gravada" if result.status is IngestStatus.SAVED else "FALHOU"
+            dono = event.tenant_id or "SEM-CLIENTE"
+            print(f"[MSG] {result.machine_code}/{event.category} (tenant={dono}) {status}")
+            # Empurra para o painel no mesmo instante (best-effort, nao bloqueia).
+            if self._notifier is not None and result.status is IngestStatus.SAVED:
+                self._notifier.notify(event)
+
+    # --- Ciclo de vida --------------------------------------------------------
+
+    def run_forever(self) -> None:
+        s = self._settings
+        print(f"Conectando a {s.mqtt_host}:{s.mqtt_port} ...")
+        self._client.connect(s.mqtt_host, s.mqtt_port, keepalive=60)
+        try:
+            self._client.loop_forever()
+        except KeyboardInterrupt:
+            print("\n[FIM] Encerrando por interrupcao do usuario.")
+            self._client.disconnect()
+            sys.exit(0)
